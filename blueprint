@@ -1,0 +1,343 @@
+1. 목표 및 설계 원칙
+1.1 목표
+
+다중 LLM(Gemini/ChatGPT/Perplexity) 기반의 근거 수집–검증–집필–편집–피드백 반영 전 과정을 자동화하여,
+
+최종 산출물로 **Word(.docx) 보고서 3종(각 제공자 피드백 반영본)**을 생성하는 로컬 기반 프로그램 구현.
+
+1.2 핵심 설계 원칙(고품질 달성 조건)
+
+근거 중심(RAG) 작성 고정: 로컬 DB의 근거 자료 범위 내에서만 서술하도록 강제(“근거 없는 주장 금지/불확실성 표기”).
+
+파이프라인 분리: 수집(Research)·검증(QA)·목차(Outline)·집필(Write)·편집(Edit)·피드백(Review) 단계를 독립 태스크로 구성.
+
+재현성/감사 가능성: 모든 프롬프트, 응답, 파라미터, 출처 URL, 버전, 모델명을 DB에 저장(추후 품질/비용/오류 추적 가능).
+
+토큰/컨텍스트 관리 내장: 섹션 단위 작성 + 근거 요약/압축 + 인용 리스트화로 컨텍스트 한도 내 안정 운용.
+
+Word 템플릿 기반 생성: 스타일/목차/캡션/번호 체계를 템플릿으로 고정하여 문서 퀄리티를 구조적으로 확보.
+
+2. 권장 기술 스택(로컬 우선)
+2.1 백엔드/오케스트레이션
+
+Python + FastAPI (API 서버)
+
+작업 큐: Redis + Celery(권장) 또는 RQ(단순)
+
+장시간 작업(수집/검증/집필/워드 생성)을 큐로 분리하여 UI 멈춤 방지
+
+2.2 저장소
+
+(초기) SQLite → (권장) PostgreSQL
+
+벡터검색: pgvector(PostgreSQL 확장) 권장
+
+근거 청크 임베딩 저장 → 섹션별 Top-K 검색
+
+2.3 Word 생성/시각화
+
+Word: python-docx + docx 템플릿(.docx/.dotx)
+
+표/그림:
+
+표: pandas → python-docx table
+
+그래프/도표: matplotlib로 PNG 생성 후 삽입
+
+이미지 소스: 사용자 업로드 또는 라이선스 명확한 소스만(출처/라이선스 메타 저장 및 문서 표기)
+
+2.4 UI(선택)
+
+웹 UI: React/Next.js
+
+데스크톱 패키징: Tauri 또는 Electron(필요 시)
+
+3. 전체 동작 구조(단일 프로젝트 기준)
+3.1 입력(사용자)
+
+주제, 목적, 분량(페이지/단어), 대상 독자, 문체(학술/실무/제안서), 금지/필수 항목
+
+참고자료 업로드(선택): PDF/논문/링크 목록
+
+API 키 입력(Gemini/ChatGPT/Perplexity)
+
+3.2 파이프라인(태스크 DAG)
+
+Research 수집
+
+Ingestion 정규화/청크/임베딩
+
+Hallucination 평가(근거 신뢰도 태깅)
+
+Outline(목차/섹션 요구사항 산출)
+
+Section Writing(섹션별 근거 검색→집필)
+
+Visual Assets(표/그림/이미지 생성 및 캡션/번호)
+
+Draft Word 생성(기본 보고서 1종)
+
+Provider Review(3곳에 보고서 투입→피드백 수집)
+
+Feedback Merge(각 provider별 수정 반영)
+
+Final Word 3종 생성(피드백 반영본 3개)
+
+4. 데이터베이스 설계(최소 권장 스키마)
+
+projects: 주제/목적/분량/톤/상태/생성일
+
+providers: provider명, 모델명, 파라미터(온도 등)
+
+runs: 프로젝트 실행 단위(재시도/버전 관리)
+
+queries: 단계별 프롬프트/파라미터/토큰/실행시간/에러
+
+sources: 원문 응답, URL, 발행일, provider, 신뢰도, 라이선스
+
+chunks: source 청크, 메타(주제/키워드), 연결(source_id)
+
+embeddings: chunk 벡터(또는 외부 벡터 스토어)
+
+hallucination_scores: chunk 단위 점수(근거성/일관성/검증 결과)
+
+outline_nodes: 목차 트리(레벨, 목표, 요구 근거 타입, 목표 분량)
+
+section_drafts: 섹션별 초안/수정본/버전
+
+assets: 이미지/표/그림 파일 경로, 캡션, 번호, 출처
+
+reviews: provider별 피드백 원문/구조화 결과(JSON)/적용 로그
+
+documents: 생성된 docx 파일 경로(초안/최종 3종)
+
+5. 단계별 구현 방식(요구사항 기준)
+5.1 (1) 사용자 입력 수집
+
+FastAPI 엔드포인트 예:
+
+POST /projects : 프로젝트 생성(주제/목적/분량/옵션)
+
+POST /projects/{id}/keys : API 키 등록(로컬 암호화 저장 권장)
+
+POST /projects/{id}/run : 파이프라인 실행 요청
+
+키 저장 권장
+
+OS Keychain(권장) 또는 로컬 파일에 암호화 저장(AES-GCM 등)
+
+서버 DB에 평문 저장 금지
+
+5.2 (2) Research: 3 provider에 질문하여 DB 저장
+수집 전략
+
+동일 질문 1회로 끝내지 말고 “질문 세트”로 구성:
+
+정의/배경, 최신 동향, 핵심 쟁점, 비교표 요구, 사례/수치 요구, 한계/리스크
+
+Perplexity는 출처 링크 강점을 활용: “출처/URL/발행일 포함”을 강제
+
+저장 정책(필수)
+
+요청 프롬프트, 모델, 파라미터, 응답 원문, 추출된 URL, 추출된 주장(claims)까지 저장
+
+5.3 (3) 로컬 DB 자료 Hallucination 평가
+
+요구사항의 “hallucination 평가”는 다음과 같이 정의-분해-검증-점수화로 구현하는 것이 안전합니다.
+
+(A) 주장(Claim) 추출
+
+각 source/chunk에서 “사실 주장”을 문장 단위로 추출하여 claims 테이블(또는 JSON)로 관리
+
+주장 유형 태깅: 수치/날짜/비교/인과/정의/인용
+
+(B) 검증 방법(권장 조합)
+
+내부 일관성 검사(LLM-as-judge)
+
+동일 source 내부 모순, 논리 비약, 용어 불일치 탐지
+
+교차 출처 일치성(3-provider cross-check)
+
+같은 주장에 대해 2개 이상 provider에서 동의하는지(또는 업로드 문서에서 근거가 있는지)
+
+근거 제시 가능성(Attribution Check)
+
+“이 문장을 뒷받침하는 chunk_id를 1~3개 제시하라” 요구
+
+제시 불가 시 낮은 점수 부여
+
+(선택) 웹 검증
+
+본 요구사항은 “로컬 DB 기반”이므로 필수는 아니나, 고품질이면 후속 확장으로 권장
+
+(C) 점수 예시(0~1)
+
+groundedness: 근거 청크로 뒷받침 가능 여부
+
+consistency: 내부 모순 여부
+
+cross_support: 다중 출처 합의 수준
+
+risk_level: “오류 시 영향 큰 주장”(법/의료/재무 등) 가중치
+
+활용 방식
+
+섹션 작성 시 Top-K 근거 검색 결과 중 groundedness 낮은 자료는 자동 제외
+
+문서에는 불확실 주장일 경우 “추정/가능성”으로 완화 표기
+
+5.4 (4) GPT mini로 목차 설정(목차 = 제어면)
+
+목차 노드에 아래 메타를 반드시 포함시키십시오.
+
+섹션 목표(무엇을 결론내릴지)
+
+목표 분량(단어/문단)
+
+포함해야 할 요소(정의/표/사례/한계/요약)
+
+필요한 근거 타입(수치/사례/비교/인용)
+
+금지 사항(근거 없는 단정 등)
+
+이 구조가 있어야 (5) 단계에서 토큰을 안정적으로 관리할 수 있습니다.
+
+5.5 (5) 목차 각 문단을 토큰 부족 없이 정교하게 작성
+핵심: “섹션 단위 생성” + “근거 압축”
+
+섹션마다 벡터검색으로 근거 Top-K(예: 8~15개 청크) 수집
+
+Top-K 청크를 그대로 넣지 않고, 섹션 전용 요약(압축 근거팩) 생성
+
+압축 근거팩 + 섹션 요구사항(목표/분량/표/사례)을 넣고 최종 섹션 작성
+
+섹션 작성 후 “근거 매핑(각 문단이 어떤 chunk를 근거로 했는지)”를 산출하여 인용/각주 생성
+
+토큰 운영 규칙(권장)
+
+“근거팩”의 길이를 섹션 규모에 맞춰 상한 설정(예: 1,500~3,000 tokens)
+
+긴 섹션은 2~3개의 서브섹션으로 쪼개고 마지막에 합치는 방식
+
+“요약→작성→검수” 3단계를 고정
+
+5.6 (6) 사진/표/그림 추가
+
+표: 목차 메타에 “비교표 필요”가 있으면 자동 생성
+
+예: 장단점 비교, 방법론 비교, 비용/성능 비교
+
+그림/그래프: 수치 데이터가 있으면 matplotlib로 생성
+
+사진:
+
+사용자 업로드를 1순위로 두고, 자동 수집 시 반드시 “출처/라이선스/URL” 저장 및 문서에 표기
+
+문서 내 요소 표준화
+
+그림 번호(Figure 1…), 표 번호(Table 1…), 캡션, 출처 표기 통일
+
+5.7 (7) Word(.docx) 산출
+템플릿 기반 조립(권장)
+
+미리 만든 docx 템플릿에 스타일 정의:
+
+Heading1/2/3, 본문, Caption, Reference 등
+
+python-docx로:
+
+표지 → 요약(Executive Summary) → 목차(필요 시) → 본문 → 참고문헌 → 부록 순으로 삽입
+
+참고: Word의 “자동 목차”는 스타일(Heading)이 정확해야 동작하므로 템플릿/스타일 고정이 중요합니다.
+
+5.8 (9) 3 provider 피드백 → 피드백 반영본 3개 생성
+(A) 피드백 요청 포맷(권장: 구조화 JSON)
+
+각 provider에게 다음을 요구:
+
+“오류/근거 미흡/논리 비약/중복/문체 개선/누락”을 항목별로 지적
+
+수정 제안은 패치 형태(예: 섹션ID, 기존 문장, 수정 문장, 사유, 근거)로 반환
+
+예: 구조화 출력(개념)
+
+issues[]: {section_id, severity, problem, evidence_request}
+
+patches[]: {section_id, target_text, replacement_text, rationale}
+
+(B) 피드백 수용 로직(자동 반영)
+
+패치 적용 전, 해당 구간이 로컬 근거팩으로 지지되는지 재검증
+
+근거 없는 패치(추가 주장)는 거절 또는 “불확실” 표기로 완화
+
+패치 적용 후 섹션 단위 재검수(QA)
+
+provider별로 별도 브랜치 생성:
+
+report_gemini_feedback.docx
+
+report_chatgpt_feedback.docx
+
+report_perplexity_feedback.docx
+
+6. 구현 순서(권장 개발 단계)
+
+MVP(필수 기능 최소)
+
+프로젝트 생성 → 3 provider 수집 → 목차 생성 → 섹션 작성 → docx 1종 생성
+
+검증(Hallucination) 도입
+
+claim 추출 + groundedness 점수 → 섹션 작성 시 필터링 적용
+
+시각자료 자동화
+
+표/그래프 생성, 캡션/번호/출처 표기
+
+피드백 루프(3종 산출)
+
+provider별 리뷰 요청 → JSON 피드백 파싱 → 패치 반영 → docx 3종 생성
+
+품질 고도화
+
+중복 제거, 용어 통일, 스타일 가이드, 인용/참고문헌 자동 정렬, 위험 주장 가중치 강화
+
+7. 운영상 주의사항(필수)
+
+API 키 취급
+
+로컬 암호화 저장 또는 OS Keychain 사용
+
+로그/DB에 키 평문 저장 금지
+
+출처/저작권
+
+이미지/표/인용은 출처/라이선스 저장 및 문서 표기
+
+자동 수집 기능은 기본값을 “출처 포함 가능한 자원만”으로 제한 권장
+
+감사 가능성
+
+최종 문장별 근거 chunk_id 매핑을 저장해 두면, 오류 발생 시 원인 추적이 가능해집니다.
+
+8. 권장 산출물(개발 시 문서/모듈 구조)
+
+providers/ : gemini_client.py, openai_client.py, perplexity_client.py
+
+pipeline/ : research.py, ingest.py, verify.py, outline.py, write.py, assets.py, assemble_docx.py, review.py, apply_feedback.py
+
+models/ : DB 스키마(ORM)
+
+templates/ : report_template.docx
+
+storage/ : 프로젝트별 원문/이미지/중간산출물 저장 폴더
+
+원하시면, 위 설계를 기준으로 다음 중 하나를 즉시 제공할 수 있습니다.
+
+FastAPI + Celery 기준의 엔드포인트/태스크 DAG 상세 설계(의사코드 수준)
+
+DB 스키마(ERD 수준) + “claim 추출/groundedness 평가” 프롬프트 템플릿 세트
+
+python-docx 기반 템플릿 스타일 규약(Heading/Caption/References) 및 조립 로직

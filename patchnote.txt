@@ -9,6 +9,7 @@ rm v4_pro
 .docx 에 Report 쌓고 체크포인트 생성 구조
 
 rm v5
-1. 서술구조방식 (두괄식, 미괄식), 2. flash/pro 결정 
+1. 서술구조방식 (줄글형, Bullet 항목형), 2. Gemini 모델 flash/pro 
+
 
 
